@@ -147,7 +147,7 @@ static void bounce_end_io(struct bio *bio, mempool_t *pool, int err)
 	bio_put(bio);
 }
 
-static void bounce_end_io_write(struct bio *bio, int err)
+void bounce_end_io_write(struct bio *bio, int err)
 {
 	bounce_end_io(bio, page_pool, err);
 }

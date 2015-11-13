@@ -160,6 +160,7 @@ static int __init cma_activate_area(struct cma *cma)
 		}
 		init_cma_reserved_pageblock(pfn_to_page(base_pfn));
 	} while (--i);
+	adjust_managed_cma_page_count(zone, cma->count);
 
 	return 0;
 }
@@ -262,6 +263,47 @@ err:
 }
 
 /**
+ * cma_activate_area_already_reaserved() - activate already reserved memory
+ * region and attach to device.
+ * @size: Size of the reserved area (in bytes),
+ * @base: Base address of the reserved area
+ * @dev: Pointer to device to attach
+ *
+ * This function was called by ion driver, ion drivers use cma memory to
+ * implements pmem heap, the reserver memory for cma was configed in dts
+ * /memreserve/ section , early allocator will reserver the region, when ion
+ * probe, need to activate this memory.
+ */
+int cma_activate_area_already_reaserved(struct device *dev,
+				phys_addr_t size, phys_addr_t base)
+{
+	struct cma *cma = &cma_areas[cma_area_count];
+	phys_addr_t alignment;
+	int ret = 0;
+
+	pr_debug("%s(size %lx, base %08lx, limit %08lx)\n", __func__,
+		 (unsigned long)size, (unsigned long)base);
+
+	/* Sanity checks */
+	if (cma_area_count == ARRAY_SIZE(cma_areas)) {
+		pr_err("Not enough slots for CMA reserved regions!\n");
+		WARN_ON(1);
+		return -ENOSPC;
+	}
+
+	if (!size)
+		return -EINVAL;
+
+	cma->base_pfn = PFN_DOWN(base);
+	cma->count = size >> PAGE_SHIFT;
+	cma_area_count++;
+
+	dev_set_cma_area(dev, cma);
+	cma_activate_area(cma);
+	return 0;
+}
+
+/**
  * dma_alloc_from_contiguous() - allocate pages from contiguous area
  * @dev:   Pointer to device for which the allocation is performed.
  * @count: Requested number of pages.
@@ -307,6 +349,7 @@ struct page *dma_alloc_from_contiguous(struct device *dev, int count,
 		if (ret == 0) {
 			bitmap_set(cma->bitmap, pageno, count);
 			page = pfn_to_page(pfn);
+			adjust_managed_cma_page_count(page_zone(page), -count);
 			break;
 		} else if (ret != -EBUSY) {
 			break;
@@ -353,6 +396,7 @@ bool dma_release_from_contiguous(struct device *dev, struct page *pages,
 	mutex_lock(&cma_mutex);
 	bitmap_clear(cma->bitmap, pfn - cma->base_pfn, count);
 	free_contig_range(pfn, count);
+	adjust_managed_cma_page_count(page_zone(pages), count);
 	mutex_unlock(&cma_mutex);
 
 	return true;

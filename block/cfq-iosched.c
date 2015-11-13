@@ -3271,7 +3271,8 @@ static bool cfq_may_dispatch(struct cfq_data *cfqd, struct cfq_queue *cfqq)
  * Dispatch a request from cfqq, moving them to the request queue
  * dispatch list.
  */
-static bool cfq_dispatch_request(struct cfq_data *cfqd, struct cfq_queue *cfqq)
+static bool cfq_dispatch_request(struct cfq_data *cfqd,
+		struct cfq_queue *cfqq)
 {
 	struct request *rq;
 
@@ -3302,6 +3303,450 @@ static bool cfq_dispatch_request(struct cfq_data *cfqd, struct cfq_queue *cfqq)
 	return true;
 }
 
+static void __bio_split_by_idx(struct bio *bio, int idx, struct bio **tail)
+{
+	int j, end_index;
+	struct bio *b1;
+	*tail = bio_clone(bio, GFP_NOIO|GFP_ATOMIC);
+#ifdef CONFIG_BLK_CGROUP
+	(*tail)->bi_ioc = bio->bi_ioc;
+	(*tail)->bi_css = bio->bi_css;
+#endif
+	BUG_ON(bio->bi_idx);
+	end_index = bio->bi_vcnt;
+	WARN_ON(idx <= bio->bi_idx || idx >= end_index);
+	b1 = bio;
+	b1->bi_idx = 0;
+	b1->bi_size = 0;
+	b1->bi_vcnt = 0;
+	b1->bi_phys_segments = 0;
+	for (j = 0; j < idx; j++) {
+		b1->bi_size += bio_iovec_idx(b1, j)->bv_len;
+		b1->bi_vcnt++;
+		b1->bi_phys_segments++;
+	}
+
+	b1 = *tail;
+	b1->bi_sector = bio->bi_sector + (bio->bi_size >> 9);
+	b1->bi_size = 0;
+	b1->bi_vcnt = 0;
+	b1->bi_idx = 0;
+	b1->bi_phys_segments = 0;
+	for (j = idx; j < end_index; j++) {
+		b1->bi_io_vec[b1->bi_vcnt] = b1->bi_io_vec[j];
+		b1->bi_size += bio_iovec_idx(b1, j)->bv_len;
+		b1->bi_vcnt++;
+		b1->bi_phys_segments++;
+	}
+
+}
+extern void ext4_end_bio1(struct bio *bio, int error);
+extern void ext4_end_bio(struct bio *bio, int error);
+extern void bounce_end_io_write(struct bio *bio, int err);
+static void bio_split_by_idx(struct bio *bio, int idx, int count,
+		struct bio **page_bio, struct bio **head, struct bio **tail)
+{
+	struct bio *b1, *b2;
+	bio_end_io_t *bi_end_io = bio->bi_end_io;
+	void  *bi_private = bio->bi_private;
+	bio_end_io_t  *dummy_end_io = NULL;
+	*page_bio = *head = *tail = NULL;
+
+	pr_debug(" %pf %d\n",  bio->bi_end_io, count);
+	if (bio->bi_end_io == ext4_end_bio)
+		dummy_end_io = ext4_end_bio1;
+	else
+		dummy_end_io = bi_end_io;
+
+	bio_get(bio);
+	if (bio->bi_vcnt == count) { /* whole */
+		*page_bio = bio;
+		(*page_bio)->bi_end_io = bi_end_io;
+		(*page_bio)->bi_private = bi_private;
+		goto out;
+	}
+	if (bio->bi_idx == idx) {  /* head */
+		__bio_split_by_idx(bio, idx + count, &b1);
+		*page_bio = bio;
+		*tail = b1;
+		(*page_bio)->bi_end_io = dummy_end_io;
+		(*page_bio)->bi_private = bi_private;
+		(*tail)->bi_end_io = bi_end_io;
+		(*tail)->bi_private = bi_private;
+		if ((*page_bio)->bi_sector + ((*page_bio)->bi_size>>9)
+			!= (*tail)->bi_sector)
+			BUG();
+		goto out;
+	}
+	if (idx + count ==  bio->bi_vcnt) { /* tail */
+		__bio_split_by_idx(bio, idx, &b1);
+		*head = bio;
+		*page_bio = b1;
+		(*head)->bi_end_io = bi_end_io;
+		(*head)->bi_private = bi_private;
+		(*page_bio)->bi_end_io = dummy_end_io;
+		(*page_bio)->bi_private = bi_private;
+		if ((*head)->bi_sector + ((*head)->bi_size>>9)
+			!= (*page_bio)->bi_sector)
+			BUG();
+		goto out;
+	}
+	__bio_split_by_idx(bio, idx, &b1);
+	*head = bio;
+	__bio_split_by_idx(b1, count, &b2);
+	*page_bio = b1;
+	*tail = b2;
+	(*head)->bi_end_io = dummy_end_io;
+	(*head)->bi_private = bi_private;
+	(*page_bio)->bi_end_io = dummy_end_io;
+	(*page_bio)->bi_private = bi_private;
+	(*tail)->bi_end_io = bi_end_io;
+	(*tail)->bi_private = bi_private;
+	if ((*head)->bi_sector + ((*head)->bi_size>>9)
+		!= (*page_bio)->bi_sector)
+		BUG();
+	if ((*page_bio)->bi_sector + ((*page_bio)->bi_size>>9)
+		!= (*tail)->bi_sector)
+		BUG();
+out:
+	bio_put(bio);
+	return;
+}
+extern void __del_request(struct request_queue *q, struct request *req);
+static void extract_one_bio(struct bio *bio,
+		unsigned long start_pfn, unsigned long end_pfn,
+		struct bio_list *synclist, struct bio_list *async_list)
+{
+	struct bio_vec *bv;
+	int i;
+	unsigned long pfn;
+	struct bio *page_bio, *head_bio, *tail_bio;
+	int found_index = 0, segment_cnt = 0, found = 0;
+#ifdef CONFIG_BOUNCE
+	if (bio->bi_end_io == bounce_end_io_write) {
+		bio_list_add(synclist, bio);
+		printk("we cant split bouce bio %d\n", bio->bi_size);
+		return;
+	}
+#endif
+	bio_for_each_segment(bv, bio, i) {
+		pfn = page_to_pfn(bv->bv_page);
+		pr_debug("__pfn:%ld\n", pfn);
+		if (pfn >= start_pfn  &&  pfn <= end_pfn) {
+				pr_debug("pfn:%ld\n", pfn);
+				if (!found) {
+					found_index = i;
+					segment_cnt = 1;
+					found = 1;
+				} else if (i == found_index + segment_cnt) {
+					segment_cnt++;
+				}
+		} else if (found) {
+			bio_split_by_idx(bio, found_index, segment_cnt,
+						&page_bio, &head_bio, &tail_bio);
+			bio_list_add(synclist, page_bio);
+			if (head_bio)
+				bio_list_add(async_list, head_bio);
+			BUG_ON(!tail_bio);
+			bio = tail_bio;
+			i = 0;
+			found = 0;
+			segment_cnt = 0;
+		}
+	}
+	if (found) { /*  the last bio */
+		bio_split_by_idx(bio, found_index, segment_cnt,
+						&page_bio, &head_bio, &tail_bio);
+		bio_list_add(synclist, page_bio);
+		if (head_bio)
+			bio_list_add(async_list, head_bio);
+		BUG_ON(tail_bio);
+	} else {
+		BUG_ON(!bio);
+		bio_list_add(async_list, bio);
+	}
+}
+static void extract_bios(struct request *rq,
+		unsigned long start_pfn, unsigned long end_pfn,
+		struct bio_list *synclist, struct bio_list *async_list)
+{
+	struct bio *bio, *bio_next;
+	struct bio_vec *bv;
+	int i;
+	unsigned int pfn;
+	int found;
+	BUG_ON(!rq->bio);
+	bio = rq->bio;
+	while (bio) {
+		found = 0;
+		bio_next = bio->bi_next; /*  bio will be modify in loop */
+		bio_for_each_segment(bv, bio, i) {
+			pfn = page_to_pfn(bv->bv_page);
+			if (pfn >= start_pfn  &&  pfn <= end_pfn) {
+				extract_one_bio(bio, start_pfn, end_pfn, synclist, async_list);
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			bio_list_add(async_list, bio);
+		bio = bio_next;
+	}
+}
+struct requeue_work_struct {
+	struct work_struct  work;
+	struct bio_list blist;
+	spinlock_t lock;
+};
+static struct requeue_work_struct requeue_bio_work;
+static void submit_bio_list(struct request_queue *q,
+					struct bio_list *blist, int flag) {
+	struct bio *bio;
+	struct bio_vec *bv;
+	int i;
+	unsigned int pfn;
+	while (1) {
+		bio = bio_list_pop(blist);
+		if (!bio)
+			break;
+		bio->bi_rw |= flag;
+		bio_for_each_segment(bv, bio, i) {
+			pfn = page_to_pfn(bv->bv_page);
+		}
+		bio_get(bio);
+		submit_bio(flag, bio);
+		bio_put(bio);
+	}
+}
+static void check_pending_async_bios(
+			unsigned long start_pfn, unsigned long end_pfn,
+			struct bio_list *sync_list, struct bio_list *async_list)
+{
+	struct requeue_work_struct  *requeue_work = &requeue_bio_work;
+	struct bio_vec *bv;
+	int i;
+	unsigned long pfn;
+	struct bio_list blist;
+	struct bio *bio;
+	int found = 0;
+	bio_list_init(&blist);
+	spin_lock(&requeue_work->lock);
+	while (1) {
+		bio = bio_list_pop(&requeue_work->blist);
+		if (!bio)
+			break;
+		bio_for_each_segment(bv, bio, i) {
+			pfn = page_to_pfn(bv->bv_page);
+			pr_debug("__pfn:%lud \n", pfn);
+			if (pfn >= start_pfn  &&  pfn <= end_pfn) {
+				extract_one_bio(bio, start_pfn, end_pfn, sync_list, async_list);
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			bio_list_add(&blist, bio);
+		found = 0;
+	}
+	while (1) {
+		bio = bio_list_pop(&blist);
+		if (!bio)
+			break;
+		bio_list_add(&requeue_work->blist, bio);
+	}
+	spin_unlock(&requeue_work->lock);
+}
+static void requeue_async_bios(struct work_struct *__work)
+{
+	struct bio *bio;
+	struct requeue_work_struct  *requeue_work = container_of(
+							__work, struct requeue_work_struct, work);
+	struct bio_list  blist;
+	bio_list_init(&blist);
+	while (1) {
+		spin_lock(&requeue_work->lock);
+		bio = bio_list_pop(&requeue_work->blist);
+		spin_unlock(&requeue_work->lock);
+		if (!bio)
+			break;
+		bio_get(bio);
+		submit_bio(REQ_WRITE, bio);
+		bio_put(bio);
+	}
+}
+static void requeue_bios(struct request_queue *q,
+			struct bio_list *sync_list, struct bio_list *async_list)
+{
+	struct bio *bio;
+	int async_size = 0;
+	struct requeue_work_struct  *requeue_work = &requeue_bio_work;
+	submit_bio_list(q, sync_list, REQ_SYNC|REQ_WRITE);
+	spin_lock(&requeue_work->lock);
+	async_size = bio_list_size(&requeue_work->blist);
+	while (1) {
+		bio = bio_list_pop(async_list);
+		if (!bio)
+			break;
+		bio_list_add(&requeue_work->blist, bio);
+	}
+	spin_unlock(&requeue_work->lock);
+	if (!async_size && !bio_list_empty(&requeue_work->blist)) {
+		schedule_work((struct work_struct *)requeue_work);
+		pr_info("async_list end requeue_work->blist  %d\n",
+				bio_list_size(&requeue_work->blist));
+	}
+}
+
+static int dispatch_cfq_in_range(struct request_queue *q, struct cfq_queue *cfqq,
+					unsigned long start_pfn, unsigned long end_pfn,
+					struct bio_list *sync_list, struct bio_list *async_list)
+{
+	struct request *rq, *next_rq;
+	struct bio *bio;
+	struct bio_vec *bv;
+	unsigned int pfn;
+	int i;
+	int rq_cnt = 0;
+	int bio_cnt;
+	struct rb_node *next;
+	struct cfq_data *cfqd = q->elevator->elevator_data;
+	spin_lock_irq(q->queue_lock);
+	next = rb_first(&cfqq->sort_list);
+	if (!next)
+		goto out;
+	rq = rb_entry_rq(next);
+	if (!rq)
+		goto out;
+	do {
+		next = rb_next(&rq->rb_node);
+		bio_cnt = 0;
+		__rq_for_each_bio(bio, rq) {
+			bio_for_each_segment(bv, bio, i) {
+				pfn = page_to_pfn(bv->bv_page);
+				if (pfn >= start_pfn  &&  pfn <= end_pfn) {
+					extract_bios(rq, start_pfn, end_pfn, sync_list, async_list);
+					rq_cnt++;
+					cfq_remove_request(rq);
+					__del_request(q, rq);
+					if (cfq_cfqq_on_rr(cfqq) && RB_EMPTY_ROOT(&cfqq->sort_list)) {
+						cfq_del_cfqq_rr(cfqd, cfqq);
+						cfq_resort_rr_list(cfqd, cfqq);
+						if (cfqq == cfqd->active_queue)
+							cfqd->active_queue = NULL;
+					}
+					goto next_rq;
+				}
+			}
+		}
+next_rq:
+		if (!next)
+			break;
+		next_rq = rb_entry_rq(next);
+		rq = next_rq;
+	} while (rq);
+out:
+	spin_unlock_irq(q->queue_lock);
+	return rq_cnt;
+}
+
+struct scan_work_struct {
+	struct delayed_work  work;
+	unsigned long start_pfn;
+	unsigned long end_pfn;
+	int done;
+};
+static struct scan_work_struct scan_cma_work;
+void boost_cma_requests(struct block_device *bd, void *arg)
+{
+	struct request_queue *q;
+	struct cfq_data *cfqd;
+	struct cfq_queue *cfqq;
+	int i;
+	int ret = 0;
+	struct bio_list  sync_list;
+	struct bio_list  async_list;
+	struct scan_work_struct *work = (struct scan_work_struct *)arg;
+	unsigned long start_pfn = work->start_pfn;
+	unsigned long end_pfn = work->end_pfn;
+
+	bio_list_init(&sync_list);
+	bio_list_init(&async_list);
+
+	q = bd->bd_queue;
+	if (!q || !q->elevator) { /* sikp dm-0 block device */
+		ret = -2;
+		goto out;
+	}
+
+	if (strncmp(q->elevator->type->elevator_name, "cfq", 3)) {
+		printk("not cfq\n");
+		goto out;
+	}
+	cfqd = q->elevator->elevator_data;
+	check_pending_async_bios(start_pfn, end_pfn, &sync_list, &async_list);
+	for (i = 0; i < IOPRIO_BE_NR; i++) {
+		cfqq = cfqd->async_cfqq[0][i];
+		if (cfqq)
+			ret += dispatch_cfq_in_range(q, cfqq,
+				start_pfn, end_pfn, &sync_list, &async_list);
+	}
+	for (i = 0; i < IOPRIO_BE_NR; i++) {
+		cfqq = cfqd->async_cfqq[1][i];
+		if (cfqq)
+			ret += dispatch_cfq_in_range(q, cfqq, start_pfn, end_pfn,
+					&sync_list, &async_list);
+	}
+	cfqq = cfqd->async_idle_cfqq;
+	if (cfqq)
+		ret += dispatch_cfq_in_range(q, cfqq, start_pfn, end_pfn,
+					&sync_list, &async_list);
+	requeue_bios(q, &sync_list, &async_list);
+	pr_debug("request_cnt %d", ret);
+out:
+	return;
+}
+
+static  void  scan_cma_range_work(struct work_struct  *__work)
+{
+	int cnt;
+	struct delayed_work  *_work = container_of(__work,
+						struct delayed_work, work);
+	struct scan_work_struct  *scan_work = container_of(_work,
+						struct scan_work_struct, work);
+	iterate_bdevs(boost_cma_requests, scan_work);
+
+	if (scan_work->done)
+		return;
+	schedule_delayed_work(_work, msecs_to_jiffies(100));
+}
+void boost_cma_requests_start(unsigned long start_pfn, unsigned long end_pfn)
+{
+	struct scan_work_struct *scan_work = &scan_cma_work;
+	struct requeue_work_struct  *requeue_work = &requeue_bio_work;
+	if (!requeue_work->work.func) {
+		pr_info(" requeue_bios  init work\n");
+		INIT_WORK(&requeue_work->work, requeue_async_bios);
+		spin_lock_init(&requeue_work->lock);
+		bio_list_init(&requeue_work->blist);
+	}
+	if (!scan_work->work.work.func) {
+		printk("scan_work  init work\n");
+		INIT_DELAYED_WORK(&scan_work->work, scan_cma_range_work);
+		scan_work->done = 1;
+	}
+	scan_work->done = 1;
+	cancel_delayed_work_sync((struct delayed_work *) scan_work);
+	scan_work->start_pfn = start_pfn;
+	scan_work->end_pfn = end_pfn;
+	scan_work->done = 0;
+	schedule_delayed_work((struct delayed_work *)scan_work,
+					msecs_to_jiffies(0));
+}
+void boost_cma_requests_end(void)
+{
+	struct scan_work_struct *scan_work = &scan_cma_work;
+	scan_work->done = 1;
+}
 /*
  * Find the cfqq that we need to service and move a request from that to the
  * dispatch list

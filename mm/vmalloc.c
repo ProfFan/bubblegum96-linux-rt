@@ -593,6 +593,8 @@ static void __purge_vmap_area_lazy(unsigned long *start, unsigned long *end,
 	struct vmap_area *va;
 	struct vmap_area *n_va;
 	int nr = 0;
+	unsigned long module_space_start = ULONG_MAX;
+	unsigned long module_space_end = 0;
 
 	/*
 	 * If sync is 0 but force_flush is 1, we'll go sync anyway but callers
@@ -611,10 +613,22 @@ static void __purge_vmap_area_lazy(unsigned long *start, unsigned long *end,
 	rcu_read_lock();
 	list_for_each_entry_rcu(va, &vmap_area_list, list) {
 		if (va->flags & VM_LAZY_FREE) {
-			if (va->va_start < *start)
-				*start = va->va_start;
-			if (va->va_end > *end)
-				*end = va->va_end;
+			/*
+			 * lw: split vmalloc & vmalloc_exec address space to
+			 *  speed up flush_tlb_kernel_range
+			 */
+			if (va->va_start >= MODULES_VADDR &&
+				va->va_end < MODULES_END) {
+				if (va->va_start < module_space_start)
+					module_space_start = va->va_start;
+				if (va->va_end > module_space_end)
+					module_space_end = va->va_end;
+			} else {
+				if (va->va_start < *start)
+					*start = va->va_start;
+				if (va->va_end > *end)
+					*end = va->va_end;
+			}
 			nr += (va->va_end - va->va_start) >> PAGE_SHIFT;
 			list_add_tail(&va->purge_list, &valist);
 			va->flags |= VM_LAZY_FREEING;
@@ -626,8 +640,16 @@ static void __purge_vmap_area_lazy(unsigned long *start, unsigned long *end,
 	if (nr)
 		atomic_sub(nr, &vmap_lazy_nr);
 
-	if (nr || force_flush)
-		flush_tlb_kernel_range(*start, *end);
+	if (nr || force_flush) {
+		/* flush normal vmalloc space */
+		if (*end > *start)
+			flush_tlb_kernel_range(*start, *end);
+
+		/* flush module vmalloc space */
+		if (module_space_end > module_space_start)
+			flush_tlb_kernel_range(module_space_start,
+					       module_space_end);
+	}
 
 	if (nr) {
 		spin_lock(&vmap_area_lock);
