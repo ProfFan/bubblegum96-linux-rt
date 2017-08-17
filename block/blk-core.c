@@ -3216,23 +3216,3 @@ int __init blk_dev_init(void)
 
 	return 0;
 }
-void __del_request(struct request_queue *q, struct request *req)
-{
-	if (unlikely(!q))
-		return;
-	if (unlikely(--req->ref_count))
-		return;
-	if (ELV_ON_HASH(req))
-		hash_del(&req->hash);
-	if (q->last_merge == req)
-		q->last_merge = NULL;
-	if (req->cmd_flags & REQ_ALLOCED) {
-		unsigned int flags = req->cmd_flags;
-		struct request_list *rl = blk_rq_rl(req);
-		WARN_ON(!list_empty(&req->queuelist));
-		WARN_ON(!hlist_unhashed(&req->hash));
-		blk_free_request(rl, req);
-		freed_request(rl, flags);
-		blk_put_rl(rl);
-	}
-}

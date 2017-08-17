@@ -66,8 +66,6 @@
 
 #include <trace/events/sched.h>
 
-#include <trace/events/readahead.h>
-
 int suid_dumpable = 0;
 
 static LIST_HEAD(formats);
@@ -777,19 +775,6 @@ struct file *open_exec(const char *name)
 	err = deny_write_access(file);
 	if (err)
 		goto exit;
-
-	/*actions_code(jiangbin,add trace for readahead)*/
-	{
-	struct inode *inode = file->f_path.dentry->d_inode;
-	if (inode && inode->i_ino && MAJOR(inode->i_sb->s_dev)) {
-
-		trace_do_open_exec(inode);
-		}
-	}
-/*end*/
-
-
-
 
 out:
 	return file;

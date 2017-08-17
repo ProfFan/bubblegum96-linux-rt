@@ -4749,7 +4749,6 @@ void show_state_filter(unsigned long state_filter)
 	if (!state_filter)
 		debug_show_all_locks();
 }
-EXPORT_SYMBOL(show_state_filter);
 
 void __cpuinit init_idle_bootup_task(struct task_struct *idle)
 {
