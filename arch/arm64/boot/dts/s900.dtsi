@@ -388,7 +388,14 @@
 		interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clock CLK_SPI0>;
 		clock-names = "spi0";
-		status = "disabled";
+		status = "okay";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_spi0_default>;
+		spidev@0 {
+			compatible = "spidev"; /* "rohm,dh2228fv"; */
+			reg = <0>;
+			spi-max-frequency = <10000000>;
+		};
 	};
 
 	i2c0: i2c@e0170000 {

@@ -52,6 +52,24 @@
 			};
 		};
 
+		pinctrl_spi0_default: spi0 {
+				spi0_mfp {
+						actions,groups = "mfp1_5_4", "mfp1_3_1_spi0_ss", "mfp1_3_1_spi0_miso";
+						actions,function = "spi0";
+				};
+				
+				spi0_pull {
+					actions,pins = "P_SPI0_SCLK", "P_SPI0_MOSI";
+					actions,pull = <0>;
+				};
+
+				spi0_paddrv {
+					actions,groups = "paddrv1_15_14";
+					actions,paddrv = <3>;
+				};
+		};
+
+
 		pinctrl_gpio_lvds_e: gpio_lvds_e {
 			gpio_lvds_e_mfp {
 				actions,groups = "mfp1_21_lvds_e";
@@ -105,7 +123,7 @@
 
 			sd0_d0_d3_cmd_clk_paddrv  {
 				actions,groups  = "paddrv1_21_20","paddrv1_17_16";
-				actions,paddrv  = <3>; /*level 3£¬0~3*/
+				actions,paddrv  = <3>; /*level 3ï¿½ï¿½0~3*/
 			};
 
 			serial_5 {

@@ -60,6 +60,19 @@
 				actions,pull = <2>;
 			};
 		};
+
+		pinctrl_i2c3: i2c3 {
+			i2c3_mfp {
+				actions,groups = "mfp0_1_0";
+				actions,function = "i2c3";
+			};
+
+			i2c3_pull {
+				actions,pins = "P_PCM1_IN", "P_PCM1_OUT";
+				actions,pull = <2>;
+			};
+		};
+		
 		
 		inctrl_i2c0_default: i2c0 {
 			i2c0_mfp {
